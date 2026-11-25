@@ -20,6 +20,8 @@ from .models import (
     NdtOrderOut,
     RepairIn,
     RepairIngestResult,
+    RepairLookupOut,
+    RepairLookupRequest,
     RepairOut,
     RepairUpdateIn,
 )
@@ -54,11 +56,21 @@ app = FastAPI(
         "**Repair ingest**: `POST /repairs` backfills; `PUT /repairs/{repair_no}` "
         "corrects under the same number. Both re-check only certificates the old "
         "or new repair can truncate and return the changed cert numbers with "
-        "before/after gaps. Repair and audit are committed atomically."
+        "before/after gaps. Repair and audit are committed atomically.\n\n"
+        "**Reverse lookup**: `POST /repairs/{repair_no}/time-lookup` is read-only. "
+        "Given the repair number, an inclusive UTC search window and each "
+        "certificate's complete expected gap list, it returns every instant at "
+        "which that repair's recorded time would reproduce those gaps — per "
+        "certificate and the common times across all of them. The repair's other "
+        "fields stay fixed; every other repair keeps its recorded time."
     ),
     openapi_tags=[
         {"name": "check", "description": "查证书缺口（只采信证上引用、签发前完成的同缝探伤）"},
         {"name": "repairs", "description": "补录 / 同号更正返修单，返回缺口变化的证号与前后缺口"},
+        {
+            "name": "lookup",
+            "description": "只读反查：按各证当时的缺口清单推算返修单时刻",
+        },
         {"name": "reference", "description": "探伤单与合格证建档"},
         {"name": "ops", "description": "健康检查"},
     ],
@@ -197,5 +209,42 @@ def put_repair(
     """
     try:
         return service.correct_repair(conn, repair_no, body)
+    finally:
+        conn.close()
+
+
+@app.post(
+    "/repairs/{repair_no}/time-lookup",
+    response_model=RepairLookupOut,
+    tags=["lookup"],
+    summary="按各证缺口反查返修单时刻（只读）",
+)
+def post_repair_time_lookup(
+    repair_no: str,
+    body: RepairLookupRequest,
+    conn: sqlite3.Connection = Depends(_db_conn),
+):
+    """Find every instant at which this repair would reproduce the given gaps.
+
+    The lookup is read-only: it loads the selected certificates and the
+    archive rows needed to re-derive their evidence in one snapshot
+    transaction.  The repair's number, weld and interval stay as archived;
+    only its ``occurred_at`` is solved for.  All other repairs keep their
+    recorded times.
+
+    Evidence and invalidation follow exactly the read-path rules: only cited,
+    same-weld NDT orders completed strictly before issuance count, coverage is
+    clipped to the approved interval, and a repair invalidates only while
+    ``completed < occurred_at < issued``.
+
+    For each certificate the response gives every matching time in the
+    inclusive search window as open/closed spans plus isolated instants;
+    ``common`` is the intersection across all listed certificates.  ``status``
+    is ``found`` when that intersection is non-empty, ``no_common_time`` when
+    each certificate has a solution but they never coincide, and
+    ``unsatisfiable`` when at least one certificate has no matching time.
+    """
+    try:
+        return service.lookup_repair_time(conn, repair_no, body)
     finally:
         conn.close()
